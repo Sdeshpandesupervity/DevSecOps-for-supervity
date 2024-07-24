@@ -1,44 +1,160 @@
 trigger:
-- master
+- main
 
-pool:
-  vmImage: ubuntu-latest
+resources:
+  repositories:
+    - repository: github_repo
+      type: github
+      name: asecurityguru/devsecops-aws-end-to-end-repo
+      endpoint: github_service_connection
 
 variables:
-- group: "SECURE_TOKENS"
-- name: snyk_token
-  value: $[variables.SNYKTOKEN]
-- name: sonar_token
-  value: $[variables.SONARTOKEN]
+  sonarCloudProjectKey: 'your-sonar-project-key'
+  sonarCloudOrganization: 'your-sonar-organization'
+  sonarCloudToken: 'your-sonar-token'
+  trivyReport: 'trivy-report.json'
+  sbomFile: 'bom.xml'
+  defectDojoServer: 'your-defectdojo-server'
+  defectDojoApiKey: 'your-defectdojo-api-key'
+  awsEcrRegistry: 'yourawsaccountid.dkr.ecr.us-west-2.amazonaws.com/app_repo'
+  azureSubscriptionEndpoint: 'your-azure-subscription'
+  azureResourceGroup: 'your-azure-resource-group'
+  kubernetesCluster: 'your-kubernetes-cluster'
 
-jobs:
-- job: Sonar_SAST_Scan_Job
-  container: maven:3.8.1-openjdk-17-slim
-  steps:
-  - script: |
-      mvn verify package sonar:sonar -Dsonar.host.url=https://sonarcloud.io/ -Dsonar.organization=azuredevopsdevsecopsoorg -Dsonar.projectKey=azuredevsecopsoprojectkey -Dsonar.token=$(sonar_token)
-    displayName: "Integrate SAST using SonarCloud to populate code coverage and secure pipeline variable in Azure DevOps DevSecOps Pipeline"
+stages:
+- stage: CodeAnalysis
+  jobs:
+  - job: SonarCloud
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: github_repo
+    - task: SonarCloudPrepare@1
+      inputs:
+        SonarCloud: 'your-sonar-service-connection'
+        organization: '$(sonarCloudOrganization)'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: '$(sonarCloudProjectKey)'
+        cliProjectName: 'your-project-name'
+        cliProjectVersion: '1.0'
+    - script: |
+        sonar-scanner \
+          -Dsonar.projectKey=$(sonarCloudProjectKey) \
+          -Dsonar.organization=$(sonarCloudOrganization) \
+          -Dsonar.sources=. \
+          -Dsonar.host.url=https://sonarcloud.io \
+          -Dsonar.login=$(sonarCloudToken)
+      displayName: 'Run SonarCloud Scan'
+    - script: |
+        curl -X POST \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $(defectDojoApiKey)" \
+          -d @sonar-report.json \
+          $(defectDojoServer)/api/v2/import-scan/
+      displayName: 'Send SonarQube results to DefectDojo'
 
-- job: Snyk_SCA_Scan_Job
-  dependsOn: Sonar_SAST_Scan_Job
-  steps:
-  - script: |
-      SNYK_TOKEN=$(snyk_token)
-      export SNYK_TOKEN
-      mvn snyk:test -fn 
-    displayName: "Integrate SCA scan using Snyk in ADO DevSecOps Pipeline"
+- stage: Build
+  jobs:
+  - job: BuildImage
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: github_repo
+    - task: Docker@2
+      inputs:
+        containerRegistry: '$(dockerRegistryServiceConnection)'
+        repository: 'my-app'
+        command: 'buildAndPush'
+        Dockerfile: 'Dockerfile'
+        tags: |
+          $(Build.BuildId)
+    - script: |
+        trivy image --format json --output $(trivyReport) $(awsEcrRegistry):$(Build.BuildId)
+      displayName: 'Run Trivy Scan'
+    - task: TrivySbom@0
+      inputs:
+        imageName: '$(awsEcrRegistry):$(Build.BuildId)'
+        outputFile: '$(sbomFile)'
+    - script: |
+        curl -X POST \
+          -H "Content-Type: application/json" \
+          -H "X-Api-Key: $(dependencyTrackApiKey)" \
+          -d @$(sbomFile) \
+          $(dependencyTrackServer)/api/v1/bom
+      displayName: 'Send SBOM to Dependency Track'
+    - script: |
+        curl -X POST \
+          -H "Content-Type: multipart/form-data" \
+          -H "Authorization: Token $(defectDojoApiKey)" \
+          -F "file=@$(sbomFile)" \
+          $(defectDojoServer)/api/v2/import-scan/
+      displayName: 'Send SBOM to DefectDojo'
+    - script: |
+        curl -X POST \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $(defectDojoApiKey)" \
+          -d @$(trivyReport) \
+          $(defectDojoServer)/api/v2/import-scan/
+      displayName: 'Send Trivy Report to DefectDojo'
 
-- job: ZAP_DAST_Scan_Job
-  dependsOn: Snyk_SCA_Scan_Job
-  steps:
-  - script: |
-      wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
-      tar -xvf ZAP_2.14.0_Linux.tar.gz
-      cd ZAP_2.14.0
-      ./zap.sh -cmd -quickurl https://www.example.com -quickprogress -quickout /home/vsts/work/1/a/zap_report.html 
-    displayName: "Integrate DAST using OWASP ZAP in ADO DevSecOps Pipeline"
+- stage: Deploy
+  dependsOn: BuildImage
+  jobs:
+  - deployment: DeployToK8s
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Kubernetes@1
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscriptionEndpoint)'
+              azureResourceGroup: '$(azureResourceGroup)'
+              kubernetesCluster: '$(kubernetesCluster)'
+              namespace: 'default'
+              command: 'apply'
+              useConfigurationFile: true
+              configuration: 'manifests/deployment.yaml'
+          - script: |
+              curl -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $(defectDojoApiKey)" \
+                -d '{"image": "$(awsEcrRegistry):$(Build.BuildId)"}' \
+                $(defectDojoServer)/api/v2/webhooks/
+            displayName: 'Configure Webhook between ACR and Docker Hub'
+          - script: |
+              docker run -d --name owasp-zap -p 8080:8080 owasp/zap2docker-stable
+            displayName: 'Configure OWASP ZAP'
+          - script: |
+              helm install falco falcosecurity/falco --namespace falco
+            displayName: 'Install Falco'
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: 'user@domain.com'
+              instructions: 'Please validate the deployment and approve.'
+              onTimeout: 'reject'
+              timeout: '30'
 
-  - task: PublishBuildArtifacts@1
-    inputs:
-      pathToPublish: '$(Build.ArtifactStagingDirectory)'
-      artifactName: zap_report.html
+- stage: Monitoring
+  jobs:
+  - job: SetupMonitoring
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: HelmInstaller@0
+      inputs:
+        helmVersion: 'v3.2.1'
+    - script: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        helm install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring
+      displayName: 'Install Prometheus'
+    - script: |
+        helm repo add grafana https://grafana.github.io/helm-charts
+        helm repo update
+        helm install grafana grafana/grafana --namespace monitoring
+      displayName: 'Install Grafana'
