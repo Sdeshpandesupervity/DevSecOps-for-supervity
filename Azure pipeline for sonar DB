@@ -1,0 +1,32 @@
+stages:
+- stage: CodeAnalysis
+  jobs:
+  - job: SonarCloud
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: github_repo
+    - task: SonarCloudPrepare@1
+      inputs:
+        SonarCloud: 'your-sonar-service-connection'
+        organization: '$(sonarCloudOrganization)'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: '$(sonarCloudProjectKey)'
+        cliProjectName: 'your-project-name'
+        cliProjectVersion: '1.0'
+    - script: |
+        sonar-scanner \
+          -Dsonar.projectKey=$(sonarCloudProjectKey) \
+          -Dsonar.organization=$(sonarCloudOrganization) \
+          -Dsonar.sources=. \
+          -Dsonar.host.url=https://sonarcloud.io \
+          -Dsonar.login=$(sonarCloudToken)
+      displayName: 'Run SonarCloud Scan'
+    - script: |
+        curl -X POST \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $(defectDojoApiKey)" \
+          -d @sonar-report.json \
+          $(defectDojoServer)/api/v2/import-scan/
+      displayName: 'Send SonarQube results to DefectDojo'
