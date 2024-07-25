@@ -1,11 +1,70 @@
-  app:
-    build: .
+version: '3.7'
+
+services:
+  trivy:
+    image: aquasec/trivy:latest
+    command: "image --no-progress my-image"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - devsecops
+
+  owasp-zap:
+    image: owasp/zap2docker-stable
     ports:
       - "8080:8080"
+    command: zap.sh -daemon -port 8080 -host 0.0.0.0
+    networks:
+      - devsecops
+
+  defectdojo:
+    image: defectdojo/defectdojo-django:latest
+    ports:
+      - "8081:8080"
     environment:
-      - SPRING_PROFILES_ACTIVE=prod
+      DD_DATABASE_URL: "postgresql://user:password@hostname/dbname"
+    networks:
+      - devsecops
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - devsecops
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    networks:
+      - devsecops
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      
   mysql:
     image: mysql:5.7
     environment:
       MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: your_db
+      MYSQL_DATABASE: your_db 
+  falco:
+    image: falcosecurity/falco-no-driver:latest
+    privileged: true
+    network_mode: "host"
+    pid: "host"
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock
+      - /dev:/host/dev
+      - /proc:/host/proc:ro
+      - /boot:/host/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+    networks:
+      - devsecops
+
+networks:
+  devsecops:
+    driver: bridge
+
